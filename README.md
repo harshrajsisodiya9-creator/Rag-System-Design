@@ -1,5 +1,5 @@
 Practicing different approaches for a RAG based pipelines
-current progress includes chunking of either txt or pdf documents using structure aware chunking
+, current progress includes chunking of either txt or pdf documents using structure aware chunking
 which break chunks when stumbling upon Q: and includes answers with the chunk too
 
 Example '.txt' or '.pdf' input:
