@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -15,6 +17,7 @@ load_dotenv()
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from rank_bm25 import BM25Okapi
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -49,6 +52,21 @@ class FileReport:
 
 _index_lock = asyncio.Lock()
 _vector_store: FAISS | None = None
+_indexed_documents: list[Document] = []
+_bm25_index: BM25Okapi | None = None
+
+
+def tokenize(text: str) -> list[str]:
+    """Use the same lightweight tokenization for indexed text and queries."""
+    return re.findall(r"\w+", text.lower())
+
+
+def rebuild_bm25_index() -> None:
+    """Rebuild the lexical index from chunks successfully added to FAISS."""
+    global _bm25_index
+    _bm25_index = BM25Okapi(
+        [tokenize(document.page_content) for document in _indexed_documents]
+    )
 
 
 def get_embeddings() -> GoogleGenerativeAIEmbeddings:
@@ -74,6 +92,51 @@ def embed_with_backoff(
 
 def batches(items: list[Document], size: int) -> list[list[Document]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+# search_index() itself does not modify FAISS. The lock is there to prevent a lookup
+# from running at the same time as /ingest is adding vectors.
+async def search_index(query: str, k: int = 4) -> list[Document]:
+    """Retrieve the nearest FAQ chunks from the in-memory FAISS index."""
+    async with _index_lock:
+        if _vector_store is None:
+            raise LookupError("No FAQ chunks have been ingested yet")
+        return await asyncio.to_thread(_vector_store.similarity_search, query, k=k)
+
+
+async def hybrid_search(
+    query: str, k: int = 4, rrf_constant: int = 60
+) -> list[Document]:
+    """Fuse dense FAISS and lexical BM25 results with reciprocal-rank fusion."""
+    async with _index_lock:
+        if _vector_store is None:
+            raise LookupError("No FAQ chunks have been ingested yet")
+
+        candidate_count = min(len(_indexed_documents), max(k * 3, k))
+        dense_documents = await asyncio.to_thread(
+            _vector_store.similarity_search, query, k=candidate_count
+        )
+        lexical_documents: list[Document] = []
+        query_tokens = tokenize(query)
+        if _bm25_index is not None and query_tokens:
+            scores = _bm25_index.get_scores(query_tokens)
+            ranked_indexes = sorted(
+                range(len(scores)), key=lambda index: scores[index], reverse=True
+            )
+            lexical_documents = [
+                _indexed_documents[index] for index in ranked_indexes[:candidate_count]
+            ]
+
+        fused_scores: defaultdict[str, float] = defaultdict(float)
+        documents_by_id: dict[str, Document] = {}
+        for ranked_documents in (dense_documents, lexical_documents):
+            for rank, document in enumerate(ranked_documents, start=1):
+                document_id = str(document.metadata["document_id"])
+                documents_by_id[document_id] = document
+                fused_scores[document_id] += 1 / (rrf_constant + rank)
+
+        ranked_ids = sorted(fused_scores, key=fused_scores.__getitem__, reverse=True)
+        return [documents_by_id[document_id] for document_id in ranked_ids[:k]]
 
 
 async def ingest_files(files: list[UploadFile]) -> dict[str, Any]:
@@ -145,6 +208,8 @@ async def ingest_files(files: list[UploadFile]) -> dict[str, Any]:
                             )
                         else:
                             _vector_store.add_embeddings(pairs, metadatas=metadatas)
+                        _indexed_documents.extend(batch)
+                        rebuild_bm25_index()
                     except Exception as exc:
                         for document in batch:
                             report = reports[
